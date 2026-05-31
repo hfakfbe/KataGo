@@ -80,6 +80,7 @@ watchgame.txt
 models/
 python/startposesupload.txt
 for_release/
+data/
 
 tests/results/matchsgfs/
 tests/results/matchsgfs2/
