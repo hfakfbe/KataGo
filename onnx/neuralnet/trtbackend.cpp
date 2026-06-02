@@ -173,7 +173,7 @@ struct ModelParser {
   ModelParser& operator=(const ModelParser&) = delete;
 
   // Bump this when between katago versions we want to forcibly drop old timing caches and plan caches.
-  static constexpr int tuneSalt = 18;
+  static constexpr int tuneSalt = 19;
 
   unique_ptr<TRTModel> build(
     unique_ptr<INetworkDefinition> net,
@@ -1211,6 +1211,19 @@ struct ComputeHandle {
         throw StringError("TensorRT backend: failed to parse ONNX model");
       }
 
+      int64_t spatialC = NNModelVersion::getNumSpatialFeatures(modelVersion);
+      int64_t globalC = NNModelVersion::getNumGlobalFeatures(modelVersion);
+      for(int i = 0; i < network->getNbInputs(); i++) {
+        ITensor* input = network->getInput(i);
+        if(input == nullptr || input->getName() == nullptr)
+          continue;
+        string inputName = input->getName();
+        if(inputName == "input_spatial")
+          input->setDimensions(Dims4(-1, spatialC, ctx->nnYLen, ctx->nnXLen));
+        else if(inputName == "input_global")
+          input->setDimensions(Dims2(-1, globalC));
+      }
+
       for(int i = 0; i < network->getNbLayers(); i++) {
         ILayer* layer = network->getLayer(i);
         std::string lname = layer->getName() ? layer->getName() : "";
@@ -1229,8 +1242,6 @@ struct ComputeHandle {
         }
       }
       
-      int64_t spatialC = NNModelVersion::getNumSpatialFeatures(modelVersion);
-      int64_t globalC = NNModelVersion::getNumGlobalFeatures(modelVersion);
       profile->setDimensions("input_spatial", OptProfileSelector::kMIN, Dims4(1, spatialC, ctx->nnYLen, ctx->nnXLen));
       profile->setDimensions("input_spatial", OptProfileSelector::kOPT, Dims4(maxBatchSize, spatialC, ctx->nnYLen, ctx->nnXLen));
       profile->setDimensions("input_spatial", OptProfileSelector::kMAX, Dims4(maxBatchSize, spatialC, ctx->nnYLen, ctx->nnXLen));

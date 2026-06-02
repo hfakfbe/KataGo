@@ -2,12 +2,12 @@
 """
 可视化 KataGo 全部训练指标，每个子图标题解释其含义。
 
-每张图 2 行 × 3 列 = 3 个指标。上行全量趋势，下行最近 N 步局部放大。
+每张图最多 2 行 × 3 列 = 3 个指标。上行全量趋势，下行最近 nsamp 窗口局部放大。
 所有图片默认输出到 metrics_train.json 所在目录。
 
 用法:
   python visualize/visualize_training_dynamics.py models/b6c96-train/metrics_train.json
-  python visualize/visualize_training_dynamics.py models/b6c96-train/metrics_train.json --last-n 300
+  python visualize/visualize_training_dynamics.py models/b6c96-train/metrics_train.json --last-nsamp 300000
 """
 
 import argparse
@@ -51,7 +51,7 @@ _FONT_NAME = _setup_chinese_font()
 if _FONT_NAME:
     print(f"使用字体: {_FONT_NAME}")
 
-# ---------- 56 个指标，每组 3 个，共 19 组 ----------
+# ---------- 指标分组，每组最多 3 个，共 19 组 ----------
 # 格式: ("分组标题", [(key, "中文解释"), ...])
 
 METRIC_GROUPS = [
@@ -163,8 +163,7 @@ METRIC_GROUPS = [
         ("wsum",        "累计权重和 (用于 EMA 指数滑动平均的归一化)"),
     ]),
 
-    ("训练速度 & 样本量 (Training Speed & Sample Count)", [
-        ("nsamp",       "累计训练样本数 (已处理的总样本量)"),
+    ("训练速度 (Training Speed)", [
         ("time_since_last_print", "输出间隔 (两次指标输出之间的秒数，反映训练速度)"),
     ]),
 ]
@@ -179,6 +178,21 @@ def load_data(path):
                 continue
             records.append(json.loads(line))
     return records
+
+
+def _to_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _format_nsamp(value):
+    if not np.isfinite(value):
+        return "nan"
+    if value == int(value):
+        return str(int(value))
+    return f"{value:g}"
 
 
 def _set_ylim_to_data(ax, values):
@@ -201,10 +215,10 @@ def _maybe_log_scale(ax, values):
         ax.set_yscale("log")
 
 
-def make_figure(all_records, group_title, metric_list, last_n, output_path):
+def make_figure(all_records, nsamp_values, group_title, metric_list, nsamp_window, output_path):
     """
     2 行 × 3 列:
-    - 第 1 列: 指标 A (上行=全量, 下行=最近 N)
+    - 第 1 列: 指标 A (上行=全量, 下行=最近 nsamp 窗口)
     - 第 2 列: 指标 B
     - 第 3 列: 指标 C
     """
@@ -216,30 +230,42 @@ def make_figure(all_records, group_title, metric_list, last_n, output_path):
     if n == 1:
         axes = axes.reshape(2, 1)
 
+    finite_nsamp = nsamp_values[np.isfinite(nsamp_values)]
+    x_end = finite_nsamp[-1]
+    x_start = x_end - nsamp_window
+    window_mask = (
+        np.isfinite(nsamp_values)
+        & (nsamp_values >= x_start)
+        & (nsamp_values <= x_end)
+    )
+
     for col, (key, label) in enumerate(metric_list):
-        values = np.array([r.get(key, float("nan")) for r in all_records], dtype=np.float64)
-        x_full = np.arange(1, len(values) + 1)
+        values = np.array([_to_float(r.get(key, float("nan"))) for r in all_records], dtype=np.float64)
 
         # ---- 上行: 全量趋势 ----
         ax_top = axes[0, col]
-        ax_top.plot(x_full, values, color="#1f77b4", linewidth=0.8)
+        ax_top.plot(nsamp_values, values, color="#1f77b4", linewidth=0.8)
         ax_top.set_title(f"全量 — {key}", fontsize=10, fontweight="bold")
-        ax_top.set_xlabel("记录点序号")
+        ax_top.set_xlabel("nsamp")
         ax_top.set_ylabel(label, fontsize=8)
         ax_top.grid(True, alpha=0.25)
         _set_ylim_to_data(ax_top, values)
         _maybe_log_scale(ax_top, values)
 
-        # ---- 下行: 最近 N 步 ----
+        # ---- 下行: 最近 nsamp 窗口 ----
         ax_bot = axes[1, col]
-        n_last = min(last_n, len(values))
-        x_last = x_full[-n_last:]
-        v_last = values[-n_last:]
+        x_last = nsamp_values[window_mask]
+        v_last = values[window_mask]
         ax_bot.plot(x_last, v_last, color="#d62728", linewidth=1.0)
-        ax_bot.set_title(f"最近 {n_last} 步 — {key}", fontsize=10, fontweight="bold")
-        ax_bot.set_xlabel("记录点序号")
+        ax_bot.set_title(
+            f"nsamp {_format_nsamp(x_start)}–{_format_nsamp(x_end)} — {key}",
+            fontsize=10,
+            fontweight="bold",
+        )
+        ax_bot.set_xlabel("nsamp")
         ax_bot.set_ylabel(label, fontsize=8)
         ax_bot.grid(True, alpha=0.25)
+        ax_bot.set_xlim(x_start, x_end)
         _set_ylim_to_data(ax_bot, v_last)
         _maybe_log_scale(ax_bot, v_last)
 
@@ -252,16 +278,27 @@ def make_figure(all_records, group_title, metric_list, last_n, output_path):
 def main():
     parser = argparse.ArgumentParser(description="可视化 KataGo 全部训练指标")
     parser.add_argument("metrics_file", help="metrics_train.json 路径")
-    parser.add_argument("--last-n", type=int, default=500,
-                        help="下行最近 N 个记录点的数量 (默认 500)")
+    parser.add_argument("--last-nsamp", "--last-n", dest="last_nsamp", type=int, default=6400000,
+                        help="下行最近 nsamp 窗口大小 (默认 6400000，即 x-6400000 到 x；--last-n 为兼容旧别名)")
     args = parser.parse_args()
 
     if not os.path.exists(args.metrics_file):
         print(f"错误: 文件不存在 — {args.metrics_file}")
         sys.exit(1)
+    if args.last_nsamp <= 0:
+        print("错误: --last-nsamp 必须为正整数")
+        sys.exit(1)
 
     records = load_data(args.metrics_file)
+    if not records:
+        print(f"错误: 文件没有可用记录 — {args.metrics_file}")
+        sys.exit(1)
     print(f"加载 {len(records)} 条记录, {len(records[0])} 个指标")
+
+    nsamp_values = np.array([_to_float(r.get("nsamp", float("nan"))) for r in records], dtype=np.float64)
+    if not np.isfinite(nsamp_values).any():
+        print("错误: 数据中没有可用的 nsamp，无法作为横坐标")
+        sys.exit(1)
 
     out_dir = os.path.dirname(os.path.abspath(args.metrics_file))
 
@@ -274,7 +311,7 @@ def main():
         fname = f"training_dynamics_{i+1:02d}.png"
         out_path = os.path.join(out_dir, fname)
         print(f"[{i+1}/{len(METRIC_GROUPS)}] {group_title}")
-        make_figure(records, group_title, available, args.last_n, out_path)
+        make_figure(records, nsamp_values, group_title, available, args.last_nsamp, out_path)
 
     print(f"\n完成，输出: {out_dir}/")
 

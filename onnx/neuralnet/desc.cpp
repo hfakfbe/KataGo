@@ -1864,6 +1864,10 @@ void ModelDesc::loadFromONNX(const string& onnxFile, ModelDesc& descBuf) {
   if(descBuf.numInputGlobalChannels != NNModelVersion::getNumGlobalFeatures(descBuf.modelVersion))
     throw StringError("ONNX model requires num_global_inputs metadata field to match modelVersion");
 
+  descBuf.postProcessParams = ModelPostProcessParams();
+  if(descBuf.modelVersion >= 13)
+    descBuf.postProcessParams.shorttermScoreErrorMultiplier = 150.0;
+
   descBuf.numPolicyChannels = 0;  // will not be used
   descBuf.numValueChannels = 0;   // will not be used
   descBuf.numScoreValueChannels = 0;
