@@ -80,6 +80,7 @@ if __name__ == "__main__":
     optional_args.add_argument('-lr-scale', help='LR multiplier on the hardcoded schedule', type=float, required=False)
     optional_args.add_argument('-lr-scale-auto', help='LR auto scaling', required=False, action='store_true')
     optional_args.add_argument('-lr-scale-auto2', help='LR auto scaling 2', required=False, type=float)
+    optional_args.add_argument('-lr-cosine', help='LR cosine decay: peak,min,start_samples,total_samples e.g. 1.0,0.05,0,600000000', required=False, type=str)
     optional_args.add_argument('-head-lr-factor', help='LR factor for output head weights', type=float, required=False, default=0.5)
     optional_args.add_argument('-noreg-lr-factor', help='LR factor for noreg params (biases, norms)', type=float, required=False, default=1.0)
     optional_args.add_argument('-muon-adam-lr-factor', help='LR factor for muon-ineligible (adam) params when using muon', type=float, required=False, default=1.0)
@@ -107,6 +108,9 @@ if __name__ == "__main__":
     optional_args.add_argument('-max-epochs-this-instance', help='Terminate training after this many more epochs', type=int, required=False)
     optional_args.add_argument('-max-training-samples', help='Terminate training after about this many training steps in samples', type=int, required=False)
     optional_args.add_argument('-sleep-seconds-per-epoch', help='Sleep this long between epochs', type=int, required=False)
+    optional_args.add_argument('-checkpoint-interval-hours', help='Interval in hours between checkpoint saves during training (0=only at epoch end)', type=float, required=False, default=0)
+    optional_args.add_argument('-warmup-samples', help='Re-warmup LR over N samples starting from current step (for dataset switch)', type=float, required=False)
+    optional_args.add_argument('-reset-optimizer-state', help='Drop optimizer momentum when loading checkpoint', required=False, action='store_true')
     optional_args.add_argument('-max-train-bucket-per-new-data', help='When data added, add this many train rows per data row to bucket', type=float, required=False)
     optional_args.add_argument('-max-train-bucket-size', help='Approx total number of train rows allowed if data stops', type=float, required=False)
     optional_args.add_argument('-max-train-steps-since-last-reload', help='Approx total of training allowed if shuffling stops', type=float, required=False)
@@ -199,6 +203,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     lr_scale = args["lr_scale"]
     lr_scale_auto = args["lr_scale_auto"]
     lr_scale_auto2 = args["lr_scale_auto2"]
+    lr_cosine = args["lr_cosine"]
     head_lr_factor = args["head_lr_factor"]
     noreg_lr_factor = args["noreg_lr_factor"]
     muon_adam_lr_factor = args["muon_adam_lr_factor"]
@@ -231,6 +236,9 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     max_val_samples = args["max_val_samples"]
     randomize_val = args["randomize_val"]
     no_export = args["no_export"]
+    checkpoint_interval_hours = args["checkpoint_interval_hours"]
+    warmup_samples = args["warmup_samples"]
+    reset_optimizer_state = args["reset_optimizer_state"]
     no_repeat_files = args["no_repeat_files"]
     quit_if_no_data = args["quit_if_no_data"]
 
@@ -254,8 +262,16 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
 
     if lr_scale is None:
         lr_scale = 1.0
-    if lr_scale_auto or lr_scale_auto2 is not None:
-        assert lr_scale == 1.0, "Cannot specify both lr_scale and lr_scale_auto"
+    if lr_scale_auto or lr_scale_auto2 is not None or lr_cosine is not None:
+        assert lr_scale == 1.0, "Cannot specify both lr_scale and lr_scale_auto/lr_scale_auto2/lr_cosine"
+    assert not (use_adamw and use_muon), "Cannot specify both use_adamw and use_muon"
+
+    def get_optimizer_name():
+        if use_adamw:
+            return "AdamW"
+        if use_muon:
+            return "Muon"
+        return "SGD"
 
     assert not (not datadir and not latestdatadir), "Must specify one of -datadir and -latestdatadir"
     assert not (datadir and latestdatadir), "Must specify only one of -datadir and -latestdatadir"
@@ -349,6 +365,23 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             if train_state["global_step_samples"] < 6400000000:
                 return 0.7
             return 0.5
+        elif lr_cosine is not None:
+            parts = lr_cosine.split(",")
+            peak_factor = float(parts[0])
+            min_factor = float(parts[1])
+            start_samples = float(parts[2])
+            total_samples = float(parts[3])
+
+            step = train_state["global_step_samples"]
+
+            if step < start_samples:
+                return peak_factor
+            elif step >= total_samples:
+                return min_factor
+            else:
+                progress = (step - start_samples) / (total_samples - start_samples)
+                cos_val = math.cos(math.pi * progress)
+                return min_factor + 0.5 * (peak_factor - min_factor) * (1.0 + cos_val)
         elif lr_scale_auto2 is not None:
             if train_state["global_step_samples"] < 20000000:
                 return 12.0 * lr_scale_auto2
@@ -640,6 +673,9 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             logging.info(f"Model norm normal baseline computed: {modelnorm_normal_baseline}")
             logging.info(f"Model norm input baseline computed: {modelnorm_input_baseline}")
 
+            optimizer_name = get_optimizer_name()
+            train_state["optimizer_name"] = optimizer_name
+
             if use_adamw:
                 optimizer = torch.optim.AdamW(get_param_groups(raw_model,train_state,running_metrics), lr=1.0)
             elif use_muon:
@@ -718,12 +754,18 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                     swa_model.load_state_dict(swa_model_state_dict)
 
             metrics_obj = Metrics(batch_size,world_size,raw_model)
+            if reset_optimizer_state and "metrics" in state_dict:
+                logging.info("Dropping metrics state (dataset switch)")
+                del state_dict["metrics"]
             if "metrics" in state_dict:
                 metrics_obj.load_state_dict(state_dict["metrics"])
             else:
                 logging.info("WARNING: Metrics not found in state dict, using fresh metrics")
 
             running_metrics = {}
+            if reset_optimizer_state and "running_metrics" in state_dict:
+                logging.info("Dropping running metrics (dataset switch)")
+                del state_dict["running_metrics"]
             if "running_metrics" in state_dict:
                 running_metrics = state_dict["running_metrics"]
             else:
@@ -735,12 +777,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             else:
                 logging.info("WARNING: Running metrics not found in state dict, using fresh last val metrics")
 
-            if use_adamw:
-                optimizer_name = "AdamW"
-            if use_muon:
-                optimizer_name = "Muon"
-            else:
-                optimizer_name = "SGD"
+            optimizer_name = get_optimizer_name()
 
             if use_adamw:
                 optimizer = torch.optim.AdamW(get_param_groups(raw_model,train_state,running_metrics), lr=1.0)
@@ -751,6 +788,10 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                     optimizer = SingleDeviceMuonWithAuxAdam(get_param_groups(raw_model,train_state,running_metrics))
             else:
                 optimizer = torch.optim.SGD(get_param_groups(raw_model,train_state,running_metrics), lr=1.0, momentum=0.9)
+            if reset_optimizer_state and "optimizer" in state_dict:
+                logging.info("Dropping optimizer state (dataset switch)")
+                del state_dict["optimizer"]
+
             if "optimizer" in state_dict:
                 old_optimizer_name = train_state.get("optimizer_name","SGD")
                 if old_optimizer_name == optimizer_name:
@@ -765,6 +806,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
 
             else:
                 logging.info("WARNING: Optimizer not found in state dict, using fresh optimizer")
+            train_state["optimizer_name"] = optimizer_name
 
             return (model_config, ddp_model, raw_model, swa_model, optimizer, metrics_obj, running_metrics, train_state, last_val_metrics)
 
@@ -786,6 +828,8 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
         train_state["window_start_data_row_idx"] = 0
     if "total_num_data_rows" not in train_state:
         train_state["total_num_data_rows"] = 0
+    if warmup_samples is not None and (reset_optimizer_state or "warmup_start_samples" not in train_state):
+        train_state["warmup_start_samples"] = train_state["global_step_samples"]
     if "old_train_data_dirs" not in train_state:
         train_state["old_train_data_dirs"] = []
     if "data_files_used" not in train_state:
@@ -880,6 +924,14 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             warmup_scale = 1.0 / 1.4
         else:
             warmup_scale = 1.0 / 1.0
+
+        # Re-warmup for dataset switch
+        if warmup_samples is not None and "warmup_start_samples" in train_state:
+            samples_since_switch = train_state["global_step_samples"] - train_state["warmup_start_samples"]
+            if samples_since_switch < warmup_samples:
+                progress = samples_since_switch / warmup_samples
+                switch_warmup = 1.0 / 20.0 + (1.0 - 1.0 / 20.0) * progress
+                warmup_scale *= switch_warmup
 
         normal_weight_decay = 0.0
 
@@ -1187,6 +1239,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     # TRAIN! -----------------------------------------------------------------------------------
 
     last_longterm_checkpoint_save_time = datetime.datetime.now()
+    last_checkpoint_save_time = datetime.datetime.now()
     try:
         longterm_checkpoint_files = glob.glob(os.path.join(longterm_checkpoints_dir, "*.ckpt"))
         if longterm_checkpoint_files:
@@ -1517,6 +1570,14 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 # Update batch renorm parameters
                 if batch_count_this_epoch % 500 == 0:
                     maybe_update_brenorm_params()
+
+                # Time-based checkpoint save
+                if checkpoint_interval_hours > 0 and rank == 0 and batch_count_this_epoch % 100 == 0:
+                    now = datetime.datetime.now()
+                    if now - last_checkpoint_save_time >= datetime.timedelta(hours=checkpoint_interval_hours):
+                        last_checkpoint_save_time = now
+                        logging.info(f"Time-based checkpoint save at {train_state['global_step_samples']} samples")
+                        save(ddp_model, swa_model, optimizer, metrics_obj, running_metrics, train_state, last_val_metrics)
 
                 # Perform lookahead
                 in_between_lookaheads = False

@@ -27,8 +27,10 @@ warnings.filterwarnings("ignore", message=".*does not have a glyph.*")
 # ---------- 中文字体 ----------
 def _setup_chinese_font():
     candidates = [
-        "Noto Serif CJK SC",
+        "Noto Sans CJK JP",     # 含 U+2212 减号字形，完整 CJK 覆盖
+        "Noto Serif CJK JP",
         "Noto Sans CJK SC",
+        "Noto Serif CJK SC",
         "AR PL UMing CN",
         "AR PL UKai CN",
         "WenQuanYi Micro Hei",
