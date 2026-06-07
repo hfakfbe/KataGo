@@ -96,3 +96,5 @@ onnx/build*
 data
 .codegraph
 matchresult
+nohup*.txt
+visualize/*.png

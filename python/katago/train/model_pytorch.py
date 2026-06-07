@@ -2364,6 +2364,79 @@ class TransformerFFNBlock(torch.nn.Module):
         return result
 
 
+class FullDepthAttentionResidual(torch.nn.Module):
+    """Full-depth Attention Residuals over prior residual components.
+
+    For trunk layer l, computes h_l by attending over residual components
+    [v_0, ..., v_{l-1}] independently for each board location, using a learned
+    pseudo-query for l. The caller appends the new residual branch output v_l.
+    """
+    def __init__(
+        self,
+        name: str,
+        num_layers: int,
+        c_main: int,
+        config: modelconfigs.ModelConfig,
+    ):
+        super(FullDepthAttentionResidual, self).__init__()
+        self.name = name
+        self.num_queries = num_layers + 1  # one extra readout query for the trunk output
+        self.c_main = c_main
+        self.eps = config.get("attention_residual_norm_epsilon", 1e-6)
+        self.scale_by_depth = config.get("attention_residual_scale_by_depth", True)
+        self.norm_weight = torch.nn.Parameter(torch.ones(c_main))
+        self.query = torch.nn.Parameter(torch.empty(self.num_queries, c_main))
+
+    def initialize(self):
+        torch.nn.init.zeros_(self.query)
+
+    def add_reg_dict(self, reg_dict:Dict[str,List]):
+        reg_dict["normal_attn"].append(self.query)
+        reg_dict["noreg"].append(self.norm_weight)
+
+    def set_brenorm_params(self, renorm_avg_momentum, rmax, dmax):
+        pass
+
+    def add_brenorm_clippage(self, upper_rclippage, lower_rclippage, dclippage):
+        pass
+
+    def make_key(self, value: torch.Tensor):
+        square_mean = torch.mean(torch.square(value), dim=1, keepdim=True)
+        scale = torch.rsqrt(square_mean + self.eps)
+        weight = self.norm_weight.to(dtype=value.dtype).view(1, self.c_main, 1, 1)
+        return value * scale * weight
+
+    def forward(
+        self,
+        values: List[torch.Tensor],
+        keys: List[torch.Tensor],
+        query_idx: int,
+        extra_outputs: Optional[ExtraOutputs] = None,
+    ):
+        assert 0 <= query_idx < self.num_queries
+        assert len(values) == len(keys)
+        assert len(values) >= 1
+        if len(values) == 1:
+            if extra_outputs is not None:
+                extra_outputs.report(self.name+".query"+str(query_idx+1)+".out", values[0])
+            return values[0]
+
+        value_tensor = torch.stack(values, dim=0)  # D,N,C,H,W
+        key_tensor = torch.stack(keys, dim=0)
+        query = self.query[query_idx].to(dtype=key_tensor.dtype)
+        logits = torch.einsum("c,dnchw->dnhw", query, key_tensor)
+        weights = torch.softmax(logits.float(), dim=0).to(dtype=value_tensor.dtype)
+        if self.scale_by_depth:
+            weights = weights * len(values)
+        out = torch.einsum("dnhw,dnchw->nchw", weights, value_tensor)
+
+        if extra_outputs is not None:
+            query_name = self.name+".query"+str(query_idx+1)
+            extra_outputs.report(query_name+".weights", weights)
+            extra_outputs.report(query_name+".out", out)
+        return out
+
+
 class PolicyHead(torch.nn.Module):
     def __init__(self, c_in, c_p1, c_g1, config, activation):
         super(PolicyHead, self).__init__()
@@ -3055,6 +3128,31 @@ class Model(torch.nn.Module):
             for k in range(num_blocks):
                 self.trunk_channel_gate_logits.append(torch.nn.Parameter(torch.zeros(1, self.c_trunk, 1, 1)))
 
+        self.attention_residual_kind = config.get("attention_residual_kind", None)
+        if self.attention_residual_kind is None:
+            self.attention_residual = None
+        elif self.attention_residual_kind == "full_depth":
+            assert not self.use_trunk_channel_gate, "Attention residuals and trunk channel gating both replace trunk accumulation"
+            self.attention_residual_block_size = 1
+            self.attention_residual = FullDepthAttentionResidual(
+                name="trunk_attnres",
+                num_layers=len(self.blocks),
+                c_main=self.c_trunk,
+                config=self.config,
+            )
+        elif self.attention_residual_kind == "block":
+            assert not self.use_trunk_channel_gate, "Attention residuals and trunk channel gating both replace trunk accumulation"
+            self.attention_residual_block_size = config["attention_residual_block_size"]
+            assert self.attention_residual_block_size >= 1
+            self.attention_residual = FullDepthAttentionResidual(
+                name="trunk_attnres",
+                num_layers=len(self.blocks),
+                c_main=self.c_trunk,
+                config=self.config,
+            )
+        else:
+            assert False, f"Unknown attention_residual_kind: {self.attention_residual_kind}"
+
         if self.trunk_final_rmsnorm:
             spatial = config.get("trunk_rmsnorm_spatial", False)
             cgroup_size = config.get("rmsnorm_spatial_cgroup_size", None) if spatial else None
@@ -3120,6 +3218,8 @@ class Model(torch.nn.Module):
                 self.gab_template_mlp.initialize()
             if self.tab_module is not None:
                 self.tab_module.initialize()
+            if self.attention_residual is not None:
+                self.attention_residual.initialize()
 
             if self.norm_kind == "fixup":
                 fixup_scale = 1.0 / math.sqrt(self.num_total_blocks)
@@ -3166,6 +3266,8 @@ class Model(torch.nn.Module):
             self.metadata_encoder.add_reg_dict(reg_dict)
         for block in self.blocks:
             block.add_reg_dict(reg_dict)
+        if self.attention_residual is not None:
+            self.attention_residual.add_reg_dict(reg_dict)
         if self.gab_template_mlp is not None:
             self.gab_template_mlp.add_reg_dict(reg_dict)
         if self.tab_module is not None:
@@ -3185,6 +3287,8 @@ class Model(torch.nn.Module):
     def set_brenorm_params(self, renorm_avg_momentum: float, rmax: float, dmax: float):
         for block in self.blocks:
             block.set_brenorm_params(renorm_avg_momentum, rmax, dmax)
+        if self.attention_residual is not None:
+            self.attention_residual.set_brenorm_params(renorm_avg_momentum, rmax, dmax)
         self.norm_trunkfinal.set_brenorm_params(renorm_avg_momentum, rmax, dmax)
         self.policy_head.set_brenorm_params(renorm_avg_momentum, rmax, dmax)
         self.value_head.set_brenorm_params(renorm_avg_momentum, rmax, dmax)
@@ -3196,6 +3300,8 @@ class Model(torch.nn.Module):
     def add_brenorm_clippage(self, upper_rclippage, lower_rclippage, dclippage):
         for block in self.blocks:
             block.add_brenorm_clippage(upper_rclippage, lower_rclippage, dclippage)
+        if self.attention_residual is not None:
+            self.attention_residual.add_brenorm_clippage(upper_rclippage, lower_rclippage, dclippage)
         self.norm_trunkfinal.add_brenorm_clippage(upper_rclippage, lower_rclippage, dclippage)
         self.policy_head.add_brenorm_clippage(upper_rclippage, lower_rclippage, dclippage)
         self.value_head.add_brenorm_clippage(upper_rclippage, lower_rclippage, dclippage)
@@ -3214,6 +3320,58 @@ class Model(torch.nn.Module):
         trunk_factor = (1.0/(block_idx+1)) * ((block_idx+2) - w)
         residual_factor = w
         return trunk_factor * trunk + residual_factor * residual
+
+    def _attention_residual_values_for_query(self, values, keys, partial_value, partial_key):
+        if partial_value is None:
+            return values, keys
+        return values + [partial_value], keys + [partial_key]
+
+    def _run_trunk_block(
+        self,
+        out,
+        block,
+        block_idx,
+        mask,
+        mask_sum_hw,
+        mask_sum,
+        extra_outputs,
+        block_shared_data,
+        attention_residual_values,
+        attention_residual_keys,
+        attention_residual_partial_value,
+        attention_residual_partial_key,
+    ):
+        if self.attention_residual is not None:
+            query_values, query_keys = self._attention_residual_values_for_query(
+                attention_residual_values,
+                attention_residual_keys,
+                attention_residual_partial_value,
+                attention_residual_partial_key,
+            )
+            out = self.attention_residual(query_values, query_keys, block_idx, extra_outputs=extra_outputs)
+            residual = block(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs, block_shared_data=block_shared_data)
+            if attention_residual_partial_value is None:
+                attention_residual_partial_value = residual
+            else:
+                attention_residual_partial_value = attention_residual_partial_value + residual
+            attention_residual_partial_key = self.attention_residual.make_key(attention_residual_partial_value)
+            if (block_idx + 1) % self.attention_residual_block_size == 0:
+                attention_residual_values.append(attention_residual_partial_value)
+                attention_residual_keys.append(attention_residual_partial_key)
+                attention_residual_partial_value = None
+                attention_residual_partial_key = None
+            return attention_residual_partial_value, attention_residual_partial_key
+
+        residual = block(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs, block_shared_data=block_shared_data)
+        if self.use_trunk_channel_gate:
+            return self._channel_gated_add(out, residual, block_idx, mask, mask_sum_hw)
+        return out + residual
+
+    def _attention_residual_readout(self, values, keys, partial_value, partial_key, query_idx, extra_outputs):
+        assert self.attention_residual is not None
+        values, keys = self._attention_residual_values_for_query(values, keys, partial_value, partial_key)
+        query_idx = min(query_idx, self.attention_residual.num_queries - 1)
+        return self.attention_residual(values, keys, query_idx, extra_outputs=extra_outputs)
 
     # Returns a tuple of tuples of outputs
     # The outer tuple indexes different sets of heads, such as if the net also computes intermediate heads.
@@ -3256,17 +3414,43 @@ class Model(torch.nn.Module):
             tab_keys, tab_queries = self.tab_module(out, mask)
             block_shared_data[TAB_KQ] = TABKeyQueryData(keys=tab_keys, queries=tab_queries)
 
+        if self.attention_residual is not None:
+            attention_residual_values = [out]
+            attention_residual_keys = [self.attention_residual.make_key(out)]
+            attention_residual_partial_value = None
+            attention_residual_partial_key = None
+        else:
+            attention_residual_values = None
+            attention_residual_keys = None
+            attention_residual_partial_value = None
+            attention_residual_partial_key = None
+
         if self.has_intermediate_head:
             count = 0
             for i, block in enumerate(self.blocks[:self.intermediate_head_blocks]):
-                residual = block(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs, block_shared_data=block_shared_data)
-                if self.use_trunk_channel_gate:
-                    out = self._channel_gated_add(out, residual, i, mask, mask_sum_hw)
+                result = self._run_trunk_block(
+                    out, block, i, mask, mask_sum_hw, mask_sum,
+                    extra_outputs, block_shared_data,
+                    attention_residual_values, attention_residual_keys,
+                    attention_residual_partial_value, attention_residual_partial_key,
+                )
+                if self.attention_residual is not None:
+                    attention_residual_partial_value, attention_residual_partial_key = result
                 else:
-                    out = out + residual
+                    out = result
                 count += 1
 
-            iout = out
+            if self.attention_residual is not None:
+                iout = self._attention_residual_readout(
+                    attention_residual_values,
+                    attention_residual_keys,
+                    attention_residual_partial_value,
+                    attention_residual_partial_key,
+                    self.intermediate_head_blocks,
+                    extra_outputs,
+                )
+            else:
+                iout = out
             iout = self.norm_intermediate_trunkfinal(iout, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum)
             iout = self.act_intermediate_trunkfinal(iout)
             # Use fp32 for output heads to handle potentially large values
@@ -3303,20 +3487,40 @@ class Model(torch.nn.Module):
                 )
 
             for i, block in enumerate(self.blocks[self.intermediate_head_blocks:], start=self.intermediate_head_blocks):
-                residual = block(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs, block_shared_data=block_shared_data)
-                if self.use_trunk_channel_gate:
-                    out = self._channel_gated_add(out, residual, i, mask, mask_sum_hw)
+                result = self._run_trunk_block(
+                    out, block, i, mask, mask_sum_hw, mask_sum,
+                    extra_outputs, block_shared_data,
+                    attention_residual_values, attention_residual_keys,
+                    attention_residual_partial_value, attention_residual_partial_key,
+                )
+                if self.attention_residual is not None:
+                    attention_residual_partial_value, attention_residual_partial_key = result
                 else:
-                    out = out + residual
+                    out = result
                 count += 1
 
         else:
             for i, block in enumerate(self.blocks):
-                residual = block(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs, block_shared_data=block_shared_data)
-                if self.use_trunk_channel_gate:
-                    out = self._channel_gated_add(out, residual, i, mask, mask_sum_hw)
+                result = self._run_trunk_block(
+                    out, block, i, mask, mask_sum_hw, mask_sum,
+                    extra_outputs, block_shared_data,
+                    attention_residual_values, attention_residual_keys,
+                    attention_residual_partial_value, attention_residual_partial_key,
+                )
+                if self.attention_residual is not None:
+                    attention_residual_partial_value, attention_residual_partial_key = result
                 else:
-                    out = out + residual
+                    out = result
+
+        if self.attention_residual is not None:
+            out = self._attention_residual_readout(
+                attention_residual_values,
+                attention_residual_keys,
+                attention_residual_partial_value,
+                attention_residual_partial_key,
+                len(self.blocks),
+                extra_outputs,
+            )
 
         out = self.norm_trunkfinal(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum)
         out = self.act_trunkfinal(out)

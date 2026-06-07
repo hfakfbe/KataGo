@@ -1558,6 +1558,26 @@ b8c96h3tfrs = {
     "v2_size":64,
 }
 
+b8c96h3tfrsattnres = {
+    **b8c96h3tfrs,
+    "attention_residual_kind":"full_depth",
+    "attention_residual_scale_by_depth":True,
+}
+
+b8c96h3tfrsattnresblock = {
+    **b8c96h3tfrs,
+    "attention_residual_kind":"block",
+    "attention_residual_block_size":2,
+    "attention_residual_scale_by_depth":True,
+}
+
+b8c96h3tfrsattnresblock4 = {
+    **b8c96h3tfrs,
+    "attention_residual_kind":"block",
+    "attention_residual_block_size":4,
+    "attention_residual_scale_by_depth":True,
+}
+
 b2b10c96h3tfrs = {
     "version":15,
     "norm_kind":"fixup",
@@ -2540,6 +2560,9 @@ base_config_of_name = {
     # Standard transformer models
     "b7c96h3tfrs": b7c96h3tfrs,
     "b8c96h3tfrs": b8c96h3tfrs,
+    "b8c96h3tfrsattnres": b8c96h3tfrsattnres,
+    "b8c96h3tfrsattnresblock": b8c96h3tfrsattnresblock,
+    "b8c96h3tfrsattnresblock4": b8c96h3tfrsattnresblock4,
     "b11c96h3tfrs": b11c96h3tfrs,
     "b14c192h6tfrs": b14c192h6tfrs,
     "b12c384h12tfrs": b12c384h12tfrs,
